@@ -12,11 +12,74 @@ import time
 import serial
 import datetime
 
-from .web import WebServer
-from .states import States
-from .keys import Keys
-
 _LOGGER = logging.getLogger(__name__)
+
+
+@unique
+class States(IntEnum):
+    """States reported by the unit"""
+    # These correspond to the LEDs on the unit
+    HEATER_1 = 1 << 0
+    VALVE_3 = 1 << 1
+    CHECK_SYSTEM = 1 << 2
+    POOL = 1 << 3
+    SPA = 1 << 4
+    FILTER = 1 << 5
+    LIGHTS = 1 << 6
+    AUX_1 = 1 << 7
+    AUX_2 = 1 << 8
+    SERVICE = 1 << 9
+    AUX_3 = 1 << 10
+    AUX_4 = 1 << 11
+    AUX_5 = 1 << 12
+    AUX_6 = 1 << 13
+    VALVE_4 = 1 << 14
+    SPILLOVER = 1 << 15
+    SYSTEM_OFF = 1 << 16
+    AUX_7 = 1 << 17
+    AUX_8 = 1 << 18
+    AUX_9 = 1 << 19
+    AUX_10 = 1 << 20
+    AUX_11 = 1 << 21
+    AUX_12 = 1 << 22
+    AUX_13 = 1 << 23
+    AUX_14 = 1 << 24
+    SUPER_CHLORINATE = 1 << 25
+    HEATER_AUTO_MODE = 1 << 30  # This is a kludge for the heater auto mode
+    FILTER_LOW_SPEED = 1 << 31  # This is a kludge for the low-speed filter
+
+
+@unique
+class Keys(IntEnum):
+    """Key events which can be sent to the unit"""
+    # Second word is the same on first down, 0000 every 100ms while holding
+    RIGHT = 0x0001
+    MENU = 0x0002
+    LEFT = 0x0004
+    SERVICE = 0x0008
+    MINUS = 0x0010
+    PLUS = 0x0020
+    POOL_SPA = 0x0040
+    FILTER = 0x0080
+    LIGHTS = 0x0100
+    AUX_1 = 0x0200
+    AUX_2 = 0x0400
+    AUX_3 = 0x0800
+    AUX_4 = 0x1000
+    AUX_5 = 0x2000
+    AUX_6 = 0x4000
+    AUX_7 = 0x8000
+    # These are only valid for WIRELESS_KEY_EVENTs
+    VALVE_3 = 0x00010000
+    VALVE_4 = 0x00020000
+    HEATER_1 = 0x00040000
+    AUX_8 = 0x00080000
+    AUX_9 = 0x00100000
+    AUX_10 = 0x00200000
+    AUX_11 = 0x00400000
+    AUX_12 = 0x00800000
+    AUX_13 = 0x01000000
+    AUX_14 = 0x02000000
 
 
 class AquaLogic():
@@ -44,10 +107,9 @@ class AquaLogic():
     FRAME_TYPE_PUMP_SPEED_REQUEST = b'\x0c\x01'
     FRAME_TYPE_PUMP_STATUS = b'\x00\x0c'
 
-    def __init__(self, web_port=8129):
+    def __init__(self):
         self._socket = None
         self._serial = None
-        self._io = None
         self._is_metric = False
         self._air_temp = None
         self._pool_temp = None
@@ -61,13 +123,12 @@ class AquaLogic():
         self._states = 0
         self._flashing_states = 0
         self._send_queue = queue.Queue()
-        self._multi_speed_pump = False
+        # MOD BEGIN
+        self._multi_speed_pump = True
+        self._heater_enabled = False
+        self._super_chlor_time_remain = '00:00'
+        # MOD END
         self._heater_auto_mode = True  # Assume the heater is in auto mode
-
-        if web_port and web_port != 0:
-            # Start the web server
-            self._web = WebServer(self)
-            self._web.start(web_port)
 
     def connect(self, host, port):
         self.connect_socket(host, port)
@@ -85,11 +146,6 @@ class AquaLogic():
                           stopbits=serial.STOPBITS_TWO, timeout=self.READ_TIMEOUT)
         self._read = self._read_byte_from_serial
         self._write = self._write_to_serial
-    
-    def connect_io(self, io):
-        self._io = io
-        self._read = self._read_byte_from_io
-        self._write = self._write_to_io
 
     def _check_state(self, data):
         desired_states = data['desired_states']
@@ -116,21 +172,15 @@ class AquaLogic():
             raise serial.SerialTimeoutException()
         return data[0]
         
-    def _read_byte_from_io(self):
-        data = self._io.read(1)
-        if len(data) == 0:
-            raise EOFError()
-        return data[0]
-    
     def _write_to_socket(self, data):
         self._socket.send(data)
     
     def _write_to_serial(self, data):
-        self._serial.send(data)
+        # MOD BEGIN
+        # self._serial.send(data)
+        self._serial.write(data)
+        # MOD END
         self._serial.flush()
-        
-    def _write_to_io(self, data):
-        self._io.write(data)
         
     def _send_frame(self):
         if not self._send_queue.empty():
@@ -277,13 +327,9 @@ class AquaLogic():
                         self._pump_power = power
                         data_changed_callback(self)
                 elif frame_type == self.FRAME_TYPE_DISPLAY_UPDATE:
-                    # Convert LCD-specific degree symbol and decode to utf-8
-                    text = frame.replace(b'\xdf', b'\xc2\xb0').decode('utf-8')
-                    parts = text.split()
+                    parts = frame.decode('latin-1').split()
                     _LOGGER.debug('%3.3f: Display update: %s',
                                   frame_start_time, parts)
-
-                    self._web.text_updated(text)
 
                     try:
                         if parts[0] == 'Pool' and parts[1] == 'Temp':
@@ -332,6 +378,34 @@ class AquaLogic():
                             if self._check_system_msg != value:
                                 self._check_system_msg = value
                                 data_changed_callback(self)
+                        # MOD BEGIN
+                        elif (parts[0] == 'Chlorinator' and parts[1] == 'Off' and 
+                            parts[2] == 'No' and parts[3] == 'Flow'):
+                            # Possible pressure issue
+                            value = ' '.join(parts[2:])
+                            if self._check_system_msg != value:
+                                self._check_system_msg = value
+                                data_changed_callback(self)
+                        elif parts[0] == 'Gas' and parts[1] == 'Heater':
+                            # Gas Heater [Auto|Manual]
+                            if parts[2] == 'Auto' and parts[3] == 'Control':
+                                value = True
+                            elif parts[2] == 'Manual' and parts[3] == 'Off':
+                                value = False
+                            if self._heater_auto_mode != value:
+                                self._heater_auto_mode = value
+                            if self._heater_enabled != value:
+                                self._heater_enabled = value
+                                data_changed_callback(self)
+                        elif (parts[0] == 'Super' and parts[1] == 'Chlorinate' and
+                            parts[3] == 'remaining'):
+                            # Super chlorination <value> remaining
+                            value = parts[2].replace(" ","")
+                            value = value.replace("º",":")
+                            if self._super_chlor_time_remain != value:
+                                self._super_chlor_time_remain = value
+                                data_changed_callback(self)
+                        # MOD END
                         elif parts[0] == 'Heater1':
                             self._heater_auto_mode = parts[1] == 'Auto'
                     except ValueError:
@@ -340,7 +414,7 @@ class AquaLogic():
                     # Not currently parsed
                     pass
                 else:
-                    _LOGGER.debug('%3.3f: Unknown frame: %s %s',
+                    _LOGGER.info('%3.3f: Unknown frame: %s %s',
                                  frame_start_time,
                                  binascii.hexlify(frame_type),
                                  binascii.hexlify(frame))
@@ -348,8 +422,6 @@ class AquaLogic():
             _LOGGER.info("socket timeout")
         except serial.SerialTimeoutException:
             _LOGGER.info("serial timeout")
-        except EOFError:
-            _LOGGER.info("eof")
 
     def _append_data(self, frame, data):
         for byte in data:
@@ -369,9 +441,16 @@ class AquaLogic():
             self._append_data(frame, key.value.to_bytes(4, byteorder='little'))
             self._append_data(frame, b'\x00')
         else:
+            # MOD BEGIN (this is where it starts breaking)
             self._append_data(frame, self.FRAME_TYPE_LOCAL_WIRED_KEY_EVENT)
+            # self._append_data(frame, self.FRAME_TYPE_REMOTE_WIRED_KEY_EVENT)
             self._append_data(frame, key.value.to_bytes(2, byteorder='little'))
+            # self._append_data(frame, b'\x00')
+            # self._append_data(frame, b'\x00')
             self._append_data(frame, key.value.to_bytes(2, byteorder='little'))
+            # self._append_data(frame, b'\x00')
+            # self._append_data(frame, b'\x00')
+            # MOD END   
 
         crc = 0
         for byte in frame:
@@ -458,8 +537,19 @@ class AquaLogic():
 
     @property
     def is_heater_enabled(self):
-        """Returns True if HEATER_1 is on"""
-        return self.get_state(States.HEATER_1)
+        # MOD BEGIN
+#        """Returns True if HEATER_1 is on"""
+#        return self.get_state(States.HEATER_1)
+        """Returns True if gas heater is Auto, else False"""
+        return self._heater_enabled
+
+    @property
+    def super_chlorinate_time_remaining(self):
+        """Returns time remaining if super chlorinate is on"""
+        if self.get_state(States.SUPER_CHLORINATE):
+        	  return self._super_chlor_time_remain
+        return '00:00'
+# MOD END
 
     @property
     def is_super_chlorinate_enabled(self):
@@ -521,10 +611,12 @@ class AquaLogic():
         elif state == States.POOL or state == States.SPA:
             key = Keys.POOL_SPA
             desired_states = [{'state': state, 'enabled': not is_enabled}]
-        elif state == States.HEATER_1:
-            # TODO: is there a way to force the heater on?
-            # Perhaps press & hold?
-            return False
+        # MOD BEGIN
+        # elif state == States.HEATER_1:
+        #     # TODO: is there a way to force the heater on?
+        #     # Perhaps press & hold?
+        #     return False
+        # MOD END
         else:
             # See if this state has a corresponding Key
             try:
