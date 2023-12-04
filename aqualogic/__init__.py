@@ -90,22 +90,26 @@ class AquaLogicProcessor(threading.Thread):
 
         while True:
             self._panel = AquaLogic()
-            if self._device == "socket":
-                _LOGGER.info("Connecting to %s:%d", self._host, self._port)
-                self._panel.connect_socket(self._host, self._port)
-            else:
-                _LOGGER.info("Connecting to %s", self._path)
-                self._panel.connect_serial(self._path)
+            try:
+                if self._device == "socket":
+                    _LOGGER.info("Connecting to %s:%d", self._host, self._port)
+                    self._panel.connect_socket(self._host, self._port)
+                else:
+                    _LOGGER.info("Connecting to %s", self._path)
+                    self._panel.connect_serial(self._path)
 
-            self._panel.process(self.data_changed)
+                self._panel.process(self.data_changed)
 
-            if self._shutdown:
-                return
+                if self._shutdown:
+                    return
 
-            if self._device == "socket":
-                _LOGGER.error("Connection to %s:%d lost", self._host, self._port)
-            else:
-            	  _LOGGER.error("Connection to %s lost", self._path)
+                if self._device == "socket":
+                    _LOGGER.error("Connection to %s:%d lost", self._host, self._port)
+                else:
+                    _LOGGER.error("Connection to %s lost", self._path)
+
+            except Exception as e:
+                _LOGGER.error("Connection exception %s", e)
 
             time.sleep(RECONNECT_INTERVAL.seconds)
 
